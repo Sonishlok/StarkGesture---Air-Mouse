@@ -2,7 +2,6 @@
 
 import sys
 import time
-from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -26,28 +25,25 @@ class CONFIG:
     MIRROR = True
     MAX_HANDS = 1
     MODEL_COMPLEXITY = 0
-    MIN_DETECT_CONF = 0.7
-    MIN_TRACK_CONF = 0.6
+    MIN_DETECT_CONF = 0.6
+    MIN_TRACK_CONF = 0.5
     PINCH_ON = 0.25
     PINCH_OFF = 0.40
     PINCH_DEBOUNCE = 0.05
     FIST_HOLD_TIME = 1.0
-    THUMBS_DOWN_HOLD = 0.4
+    L_HOLD_TIME = 0.5
     THUMB_DOWN_MIN = 0.5
+    THUMB_EXTEND_MIN = 0.55
     MODE_LOCKOUT = 1.0
     CLICK_WINDOW = 0.8
     CLICK_COOLDOWN = 0.3
-    ACTIVE_BOX_MARGIN = 0.10
-    SMOOTHING_ALPHA = 0.25
-    EDGE_PADDING_PX = 5
+    ACTIVE_BOX_MARGIN = 0.15
+    SMOOTHING = 0.45
+    EDGE_PADDING_PX = 1
     MAX_STEP_PX = 150
-    WAVE_SPEED = 1.0
-    WAVE_DEADZONE = 0.3
-    WAVE_WINDOW = 0.2
-    SCROLL_AMOUNT = 200
-    SCROLL_COOLDOWN = 0.4
-    HAND_LOST_GRACE = 0.3
-    NO_HAND_TIMEOUT = 2.0
+    SCROLL_SPEED = 600
+    SCROLL_HOLD_TIME = 0.2
+    NO_HAND_GRACE = 0.5
     EXIT_KEY = "q"
     DRY_RUN = False
     SHOW_PREVIEW = True
@@ -65,10 +61,10 @@ class Facts:
     is_fist: bool = False
     is_pinched: bool = False
     is_thumbs_down: bool = False
-    wave: str = "NONE"
+    is_l_shape: bool = False
+    is_index_up: bool = False
     pointer_xy: Optional[Tuple[float, float]] = None
     pinch_xy: Optional[Tuple[float, float]] = None
-    vy: float = 0.0
     hand_size: float = 0.0
     pinch_ratio: float = 0.0
     curled: Tuple[bool, bool, bool, bool] = (False, False, False, False)
@@ -152,9 +148,8 @@ class GestureDetector:
     FINGERS = ((8, 7), (12, 11), (16, 15), (20, 19))
 
     def __init__(self):
-        """Start with no pinch and an empty wave history."""
+        """Start with no pinch latched."""
         self.pinched = False
-        self.palm_history = deque()
 
     @staticmethod
     def _distance(a, b):
@@ -167,11 +162,10 @@ class GestureDetector:
             points[pip], points[0]
         )
 
-    def detect(self, landmarks, now):
+    def detect(self, landmarks):
         """Return the current facts for one frame."""
         if landmarks is None:
             self.pinched = False
-            self.palm_history.clear()
             return Facts()
 
         hand_size = self._distance(landmarks[0], landmarks[9])
@@ -199,27 +193,24 @@ class GestureDetector:
         elif pinch_ratio < CONFIG.PINCH_ON and guard:
             self.pinched = True
 
-        self.palm_history.append((now, landmarks[9][0], landmarks[9][1]))
-        while (
-            self.palm_history
-            and now - self.palm_history[0][0] > CONFIG.WAVE_WINDOW
-        ):
-            self.palm_history.popleft()
-        vx = 0.0
-        vy = 0.0
-        if len(self.palm_history) >= 2:
-            t0, x0, y0 = self.palm_history[0]
-            t1, x1, y1 = self.palm_history[-1]
-            elapsed = t1 - t0
-            if elapsed > 0.0:
-                vx = (x1 - x0) / elapsed
-                vy = (y1 - y0) / elapsed
-        wave = "NONE"
-        if abs(vy) > abs(vx):
-            if vy < -CONFIG.WAVE_SPEED:
-                wave = "UP"
-            elif vy > CONFIG.WAVE_SPEED:
-                wave = "DOWN"
+        thumb_extended = (
+            self._distance(landmarks[4], landmarks[9]) / hand_size
+            > CONFIG.THUMB_EXTEND_MIN
+        )
+        l_shape = (
+            not curled[0]
+            and all(curled[1:])
+            and thumb_extended
+            and not self.pinched
+        )
+        index_up = (
+            not curled[0]
+            and landmarks[8][1] < landmarks[6][1]
+            and landmarks[8][1] < landmarks[5][1]
+            and not thumb_extended
+            and all(curled[1:])
+            and pinch_ratio > CONFIG.PINCH_OFF
+        )
 
         pinch_xy = (
             (landmarks[4][0] + landmarks[8][0]) / 2.0,
@@ -230,10 +221,10 @@ class GestureDetector:
             is_fist=fist,
             is_pinched=self.pinched,
             is_thumbs_down=thumbs_down,
-            wave=wave,
+            is_l_shape=l_shape,
+            is_index_up=index_up,
             pointer_xy=landmarks[9],
             pinch_xy=pinch_xy,
-            vy=vy,
             hand_size=hand_size,
             pinch_ratio=pinch_ratio,
             curled=curled,
@@ -248,18 +239,20 @@ class StateMachine:
         """Start in NORMAL with every timer clear."""
         self.mode = "NORMAL"
         self.cursor_state = "IDLE"
+        self.l_start = None
         self.fist_start = None
-        self.thumbs_start = None
         self.pinch_start = None
         self.pinch_candidate = None
         self.release_candidate = None
         self.last_click_time = -1e9
         self.mode_change_time = -1e9
-        self.fist_rearmed = True
+        self.activation_rearmed = True
         self.no_hand_start = None
-        self.hand_lost_start = None
-        self.scroll_state = "ARMED"
-        self.last_scroll_time = -1e9
+        self.scroll_dir = None
+        self.scroll_start = None
+        self.scroll_accum = 0.0
+        self.scroll_last_time = None
+        self.l_progress = 0.0
         self.fist_progress = 0.0
         self.pinch_elapsed = 0.0
         self.moving = False
@@ -273,17 +266,43 @@ class StateMachine:
         self.pinch_elapsed = 0.0
         self.moving = False
 
+    def _reset_scroll(self):
+        """Forget the current continuous scroll gesture."""
+        self.scroll_dir = None
+        self.scroll_start = None
+        self.scroll_accum = 0.0
+        self.scroll_last_time = None
+
+    def _update_scroll(self, direction, now, actions):
+        """Accumulate continuous wheel movement while a scroll pose is held."""
+        if self.scroll_dir != direction:
+            self.scroll_dir = direction
+            self.scroll_start = now
+            self.scroll_accum = 0.0
+            self.scroll_last_time = now
+            return
+        dt = now - self.scroll_last_time if self.scroll_last_time is not None else 0.0
+        self.scroll_last_time = now
+        if now - self.scroll_start < CONFIG.SCROLL_HOLD_TIME:
+            return
+        self.scroll_accum += CONFIG.SCROLL_SPEED * dt
+        steps = int(self.scroll_accum)
+        if steps:
+            sign = 1 if direction == "UP" else -1
+            actions.append(Action("SCROLL", amount=sign * steps))
+            self.scroll_accum -= steps
+
     def _set_mode(self, mode, now):
         """Switch mode and start the lockout/re-arm rules."""
         self.mode = mode
         self.mode_change_time = now
+        self.l_start = None
+        self.l_progress = 0.0
         self.fist_start = None
         self.fist_progress = 0.0
-        self.thumbs_start = None
-        self.fist_rearmed = False
+        self.activation_rearmed = False
         self.no_hand_start = None
-        self.hand_lost_start = None
-        self.scroll_state = "ARMED"
+        self._reset_scroll()
         self._cancel_pinch()
 
     def update(self, facts, now):
@@ -297,49 +316,36 @@ class StateMachine:
             self.no_hand_start = now
 
         if self.mode == "NORMAL":
-            if facts.is_fist:
-                if self.fist_rearmed and not lockout:
-                    if self.fist_start is None:
-                        self.fist_start = now
-                    self.fist_progress = min(
-                        1.0, (now - self.fist_start) / CONFIG.FIST_HOLD_TIME
+            if facts.is_l_shape:
+                if self.activation_rearmed and not lockout:
+                    if self.l_start is None:
+                        self.l_start = now
+                    self.l_progress = min(
+                        1.0, (now - self.l_start) / CONFIG.L_HOLD_TIME
                     )
-                    if now - self.fist_start >= CONFIG.FIST_HOLD_TIME:
+                    if now - self.l_start >= CONFIG.L_HOLD_TIME:
                         self._set_mode("CURSOR", now)
                 else:
-                    self.fist_start = None
-                    self.fist_progress = 0.0
+                    self.l_start = None
+                    self.l_progress = 0.0
             else:
-                self.fist_start = None
-                self.fist_progress = 0.0
+                self.l_start = None
+                self.l_progress = 0.0
                 if facts.hand_present:
-                    self.fist_rearmed = True
+                    self.activation_rearmed = True
             return actions
 
         if not facts.hand_present:
             self.moving = False
-            if self.cursor_state == "PINCHING":
-                if self.hand_lost_start is None:
-                    self.hand_lost_start = now
-                elif now - self.hand_lost_start >= CONFIG.HAND_LOST_GRACE:
-                    self._cancel_pinch()
-            if (
+            lost_long = (
                 self.no_hand_start is not None
-                and now - self.no_hand_start >= CONFIG.NO_HAND_TIMEOUT
-            ):
-                self._set_mode("NORMAL", now)
+                and now - self.no_hand_start >= CONFIG.NO_HAND_GRACE
+            )
+            if lost_long and self.cursor_state == "PINCHING":
+                self._cancel_pinch()
+            if lost_long:
+                self._reset_scroll()
             return actions
-
-        self.hand_lost_start = None
-
-        if facts.is_thumbs_down and not lockout:
-            if self.thumbs_start is None:
-                self.thumbs_start = now
-            if now - self.thumbs_start >= CONFIG.THUMBS_DOWN_HOLD:
-                self._set_mode("NORMAL", now)
-                return actions
-        else:
-            self.thumbs_start = None
 
         if self.cursor_state == "PINCHING":
             self.pinch_elapsed = now - self.pinch_start
@@ -371,6 +377,26 @@ class StateMachine:
 
         self.moving = False
         self.pinch_elapsed = 0.0
+
+        if facts.is_fist:
+            if self.activation_rearmed and not lockout:
+                if self.fist_start is None:
+                    self.fist_start = now
+                self.fist_progress = min(
+                    1.0, (now - self.fist_start) / CONFIG.FIST_HOLD_TIME
+                )
+                if now - self.fist_start >= CONFIG.FIST_HOLD_TIME:
+                    self._set_mode("NORMAL", now)
+            else:
+                self.fist_start = None
+                self.fist_progress = 0.0
+            return actions
+
+        self.fist_start = None
+        self.fist_progress = 0.0
+        if facts.hand_present:
+            self.activation_rearmed = True
+
         if facts.is_pinched:
             if self.pinch_candidate is None:
                 self.pinch_candidate = now
@@ -380,28 +406,21 @@ class StateMachine:
                 self.pinch_candidate = None
                 self.release_candidate = None
                 self.pinch_elapsed = 0.0
+                self._reset_scroll()
                 return actions
         else:
             self.pinch_candidate = None
 
-        if self.scroll_state == "WAITING_FOR_CALM" and (
-            abs(facts.vy) < CONFIG.WAVE_DEADZONE
-        ):
-            self.scroll_state = "ARMED"
-        if (
-            self.scroll_state == "ARMED"
-            and facts.wave != "NONE"
-            and not facts.is_pinched
-            and now - self.last_scroll_time >= CONFIG.SCROLL_COOLDOWN
-        ):
-            amount = (
-                CONFIG.SCROLL_AMOUNT
-                if facts.wave == "UP"
-                else -CONFIG.SCROLL_AMOUNT
-            )
-            actions.append(Action("SCROLL", amount=amount))
-            self.last_scroll_time = now
-            self.scroll_state = "WAITING_FOR_CALM"
+        if facts.is_index_up:
+            scroll_dir = "UP"
+        elif facts.is_thumbs_down:
+            scroll_dir = "DOWN"
+        else:
+            scroll_dir = None
+        if scroll_dir is not None:
+            self._update_scroll(scroll_dir, now, actions)
+            return actions
+        self._reset_scroll()
 
         return actions
 
@@ -438,7 +457,7 @@ class CursorMapper:
             self.smooth_x = target_x
             self.smooth_y = target_y
         else:
-            alpha = CONFIG.SMOOTHING_ALPHA
+            alpha = CONFIG.SMOOTHING
             self.smooth_x = alpha * target_x + (1.0 - alpha) * self.smooth_x
             self.smooth_y = alpha * target_y + (1.0 - alpha) * self.smooth_y
 
@@ -561,14 +580,14 @@ class Display:
             frame, mode, (15, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, mode_color, 3
         )
 
-        if (
-            mode == "NORMAL"
-            and facts.is_fist
-            and state.fist_progress > 0.0
-            and landmarks
-        ):
+        ring_progress = None
+        if mode == "NORMAL" and facts.is_l_shape:
+            ring_progress = state.l_progress
+        elif mode == "CURSOR" and facts.is_fist:
+            ring_progress = state.fist_progress
+        if ring_progress and ring_progress > 0.0 and landmarks:
             center = self._to_px(landmarks[0], frame)
-            end_angle = -90 + int(360.0 * state.fist_progress)
+            end_angle = -90 + int(360.0 * ring_progress)
             cv2.ellipse(
                 frame,
                 center,
@@ -678,11 +697,12 @@ class Display:
     def _draw_help(self, frame, width):
         """Draw the first-run gesture panel."""
         lines = [
-            "FIST hold 1 s   -> CURSOR",
-            "QUICK PINCH     -> click",
-            "PINCH hold      -> move cursor",
-            "WAVE up / down  -> scroll",
-            "THUMBS DOWN     -> NORMAL",
+            "L SHAPE hold .5s -> CURSOR",
+            "QUICK PINCH      -> click",
+            "PINCH hold       -> move cursor",
+            "INDEX UP         -> scroll up",
+            "THUMBS DOWN      -> scroll down",
+            "FIST hold 1s     -> NORMAL",
             "Quit: q or Ctrl+C",
         ]
         x = max(10, width - 280)
@@ -720,11 +740,11 @@ def main():
         camera = Camera()
         print(
             "STARK GESTURES: hand gesture mouse\n"
-            "  1. FIST, hold 1 sec ........ turn ON (CURSOR mode)\n"
+            "  1. L SHAPE, hold 0.5 sec ... turn ON (CURSOR mode)\n"
             "  2. PINCH, quick ............ left click\n"
             "  3. PINCH, hold ............. move the cursor\n"
-            "  4. WAVE up / down .......... scroll\n"
-            "  5. THUMBS DOWN ............. turn OFF (NORMAL mode)\n"
+            "  4. INDEX UP ................ scroll up\n"
+            "  5. THUMBS DOWN ............. scroll down\n"
             "  Quit: click the camera window, press q   (or Ctrl+C here)\n"
             "  Tip: rest your elbow on the desk. Keep the other hand out of view."
         )
@@ -752,7 +772,7 @@ def main():
             read_failures = 0
 
             landmarks = tracker.process(frame)
-            facts = detector.detect(landmarks, now)
+            facts = detector.detect(landmarks)
             actions = state.update(facts, now)
 
             moving_this_frame = False
